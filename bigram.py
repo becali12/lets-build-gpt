@@ -8,6 +8,7 @@ block_size = 8           # maximum context length for predictions
 max_iters = 10000        # number of training steps
 eval_interval = 500      # how often to report train/val loss
 eval_iters = 200         # how many batches to average when estimating loss
+n_embd = 32
 learning_rate = 1e-3
 if torch.cuda.is_available():
     device = 'cuda'                    # NVIDIA GPU
@@ -73,12 +74,20 @@ def estimate_loss(model):
 
 # ---- model ----
 class BigramLanguageModel(nn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
-        logits = self.token_embedding_table(idx)  # (B, T, C)
+        B, T = idx.shape
+
+        token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
+        position_embeddings = self.position_embedding_table(torch.arange(T, device=device))
+        x = token_embeddings + position_embeddings    
+    
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -107,7 +116,7 @@ def generate_answer(model, max_new_tokens=100):
 
 # ---- train ----
 def main():
-    model = BigramLanguageModel(vocab_size).to(device)
+    model = BigramLanguageModel().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     for step in range(max_iters):
