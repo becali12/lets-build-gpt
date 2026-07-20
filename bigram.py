@@ -6,7 +6,15 @@ from torch.nn import functional as F
 batch_size = 32          # how many independent sequences we process in parallel
 block_size = 8           # maximum context length for predictions
 max_iters = 10000        # number of training steps
+eval_interval = 500      # how often to report train/val loss
+eval_iters = 200         # how many batches to average when estimating loss
 learning_rate = 1e-3
+if torch.cuda.is_available():
+    device = 'cuda'                    # NVIDIA GPU
+elif torch.backends.mps.is_available():
+    device = 'mps'                     # Apple Silicon GPU (Metal)
+else:
+    device = 'cpu'
 # -------------------------
 
 torch.manual_seed(1337)  # reproducible runs
@@ -43,7 +51,24 @@ def get_batch(split):
     random_positions = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i + block_size] for i in random_positions])
     y = torch.stack([data[i + 1:i + 1 + block_size] for i in random_positions])
+    x, y = x.to(device), y.to(device)
     return x, y
+
+
+@torch.no_grad()
+def estimate_loss(model):
+    """Average the loss over several batches for a less noisy train/val reading."""
+    out = {}
+    model.eval()
+    for split in ('train', 'val'):
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            xb, yb = get_batch(split)
+            _, loss = model(xb, yb)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
 
 
 # ---- model ----
@@ -76,16 +101,21 @@ class BigramLanguageModel(nn.Module):
 
 
 def generate_answer(model, max_new_tokens=100):
-    context = torch.zeros((1, 1), dtype=torch.long)
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
     print(decode(model.generate(context, max_new_tokens)[0].tolist()))
 
 
 # ---- train ----
 def main():
-    model = BigramLanguageModel(vocab_size)
+    model = BigramLanguageModel(vocab_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     for step in range(max_iters):
+        # every so often, report averaged train/val loss
+        if step % eval_interval == 0:
+            losses = estimate_loss(model)
+            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
         xb, yb = get_batch('train')
 
         logits, loss = model(xb, yb)
