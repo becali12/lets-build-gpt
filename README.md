@@ -31,7 +31,7 @@ The training corpus is two of Dostoevsky's novels - *The Brothers Karamazov* and
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install torch
+pip install -r requirements.txt
 
 python bigram.py
 ```
