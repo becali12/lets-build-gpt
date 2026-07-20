@@ -1,4 +1,4 @@
-# build_your_gpt
+# Let's build GPT!
 
 A from-scratch language model trained on the works of Fyodor Dostoevsky.
 
