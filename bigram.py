@@ -1,19 +1,26 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import time
 
 # ---- hyperparameters ----
-batch_size = 32          # how many independent sequences we process in parallel
-block_size = 8           # maximum context length for predictions
-max_iters = 10000        # number of training steps
+batch_size = 64          # how many independent sequences we process in parallel
+block_size = 128          # maximum context length for predictions
+max_iters = 5000        # number of training steps
 eval_interval = 500      # how often to report train/val loss
-eval_iters = 200         # how many batches to average when estimating loss
-n_embd = 32
-learning_rate = 1e-3
+eval_iters = 50         # how many batches to average when estimating loss
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+learning_rate = 1e-4
+
+
 if torch.cuda.is_available():
     device = 'cuda'                    # NVIDIA GPU
 elif torch.backends.mps.is_available():
     device = 'mps'                     # Apple Silicon GPU (Metal)
+    print('Apple fanboy innit')
 else:
     device = 'cpu'
 # -------------------------
@@ -79,6 +86,8 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
 
     def forward(self, x):
         B, T, C = x.shape
@@ -89,6 +98,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         
         v = self.value(x)
         out = wei @ v
@@ -99,44 +109,65 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
 
 
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
         return self.net(x)
 
 
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
 # ---- model ----
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
+        # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
-        self.sa_heads = MultiHeadAttention(4, n_embd//4)
-        self.ffwd = FeedForward(n_embd)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
-        token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
-        position_embeddings = self.position_embedding_table(torch.arange(T, device=device))
-        
-        x = token_embeddings + position_embeddings    
-        x = self.sa_heads(x)
-        x = self.ffwd(x)
-    
-        logits = self.lm_head(x)
+        # idx and targets are both (B,T) tensor of integers
+        tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        x = tok_emb + pos_emb # (B,T,C)
+        x = self.blocks(x) # (B,T,C)
+        x = self.ln_f(x) # (B,T,C)
+        logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
             loss = None
@@ -159,9 +190,14 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-def generate_answer(model, max_new_tokens=100):
+def generate_answer(model, max_new_tokens=100, filename="generated_text.txt"):
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    print(decode(model.generate(context, max_new_tokens)[0].tolist()))
+    generated_chars = decode(model.generate(context, max_new_tokens)[0].tolist())
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(generated_chars)
+    
+    print(f"Generated {max_new_tokens} characters saved to {filename}")
 
 
 # ---- train ----
@@ -169,11 +205,14 @@ def main():
     model = BigramLanguageModel().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
+    start_time = time.time()
+
     for step in range(max_iters):
         # every so often, report averaged train/val loss
         if step % eval_interval == 0:
             losses = estimate_loss(model)
-            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            elapsed = time.time() - start_time
+            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} | time elapsed: {elapsed:.1f}s")
 
         xb, yb = get_batch('train')
 
@@ -182,10 +221,12 @@ def main():
         loss.backward()   # figure out which direction each weight should move
         optimizer.step()  # nudge the weights that way
 
+    total_time = time.time() - start_time
     print(f"final loss: {loss.item():.4f}")
+    print(f"Total training time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
 
     # sample some text from the trained model
-    generate_answer(model, 300)
+    generate_answer(model, 10000)
 
 
 if __name__ == '__main__':
